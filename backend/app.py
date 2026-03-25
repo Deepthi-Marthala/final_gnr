@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, session
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
 
@@ -7,11 +7,10 @@ app.secret_key = 'gnr-secret'
 CORS(app)
 
 # ====================================================
-# DATABASE SETUP (AUTO SWITCH)
+# DATABASE SETUP
 # ====================================================
 
 if os.environ.get("DATABASE_URL"):
-    # 🔵 PRODUCTION (Render → PostgreSQL)
     import psycopg2
     from psycopg2.extras import RealDictCursor
 
@@ -21,9 +20,7 @@ if os.environ.get("DATABASE_URL"):
         return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
     DB_TYPE = "postgres"
-
 else:
-    # 🟢 LOCAL (SQLite)
     import sqlite3
 
     DB_PATH = os.path.join(os.path.dirname(__file__), 'gnr.db')
@@ -45,6 +42,7 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
+    # PRODUCTS TABLE
     if DB_TYPE == "postgres":
         cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
@@ -52,13 +50,7 @@ def init_db():
             name TEXT,
             category TEXT,
             price FLOAT,
-            original_price FLOAT,
-            discount INTEGER,
-            image TEXT,
-            description TEXT,
-            sizes TEXT,
-            is_new BOOLEAN DEFAULT TRUE,
-            in_stock BOOLEAN DEFAULT TRUE
+            image TEXT
         )
         """)
     else:
@@ -68,55 +60,34 @@ def init_db():
             name TEXT,
             category TEXT,
             price REAL,
-            original_price REAL,
-            discount INTEGER,
-            image TEXT,
-            description TEXT,
-            sizes TEXT,
-            is_new INTEGER DEFAULT 1,
-            in_stock INTEGER DEFAULT 1
+            image TEXT
         )
         """)
 
-    # check data
-    cur.execute("SELECT COUNT(*) FROM products")
-    count = cur.fetchone()[0] if DB_TYPE == "sqlite" else cur.fetchone()['count']
-
-    if count == 0:
-        if DB_TYPE == "postgres":
-            cur.executemany("""
-            INSERT INTO products (name,category,price,original_price,discount,image)
-            VALUES (%s,%s,%s,%s,%s,%s)
-            """, [
-                ('Crocs Clog', 'crocs', 799, 1299, 38,
-                 'https://images.unsplash.com/photo-1606107557195-0e29a4b5b4aa'),
-
-                ('Sports Shoes', 'shoes', 1499, 2499, 40,
-                 'https://images.unsplash.com/photo-1542291026-7eec264c27ff'),
-
-                ('Gold Chain', 'jewellery', 599, 999, 40,
-                 'https://images.unsplash.com/photo-1515562141207-7a88fb7ce338')
-            ])
-        else:
-            cur.executemany("""
-            INSERT INTO products (name,category,price,original_price,discount,image)
-            VALUES (?,?,?,?,?,?)
-            """, [
-                ('Crocs Clog', 'crocs', 799, 1299, 38,
-                 'https://images.unsplash.com/photo-1606107557195-0e29a4b5b4aa'),
-
-                ('Sports Shoes', 'shoes', 1499, 2499, 40,
-                 'https://images.unsplash.com/photo-1542291026-7eec264c27ff'),
-
-                ('Gold Chain', 'jewellery', 599, 999, 40,
-                 'https://images.unsplash.com/photo-1515562141207-7a88fb7ce338')
-            ])
+    # USERS TABLE ✅ NEW
+    if DB_TYPE == "postgres":
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            email TEXT UNIQUE,
+            password TEXT
+        )
+        """)
+    else:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT UNIQUE,
+            password TEXT
+        )
+        """)
 
     conn.commit()
     cur.close()
     conn.close()
 
-# ✅ IMPORTANT
 init_db()
 
 # ====================================================
@@ -125,76 +96,92 @@ init_db()
 
 @app.route('/api/products')
 def get_products():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM products ORDER BY id DESC")
+
+    if DB_TYPE == "postgres":
+        data = cur.fetchall()
+    else:
+        data = [dict(row) for row in cur.fetchall()]
+
+    cur.close()
+    conn.close()
+
+    return jsonify(data)
+
+# ====================================================
+# REGISTER API ✅
+# ====================================================
+
+@app.route('/api/register', methods=['POST'])
+def register():
     try:
+        d = request.json
+        name = d.get('name')
+        email = d.get('email')
+        password = d.get('password')
+
         conn = get_db()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM products ORDER BY id DESC")
+        if DB_TYPE == "postgres":
+            cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+        else:
+            cur.execute("SELECT * FROM users WHERE email=?", (email,))
+
+        if cur.fetchone():
+            return jsonify({"error": "User already exists"}), 400
 
         if DB_TYPE == "postgres":
-            data = cur.fetchall()
+            cur.execute(
+                "INSERT INTO users (name,email,password) VALUES (%s,%s,%s)",
+                (name, email, password)
+            )
         else:
-            data = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                "INSERT INTO users (name,email,password) VALUES (?,?,?)",
+                (name, email, password)
+            )
 
+        conn.commit()
         cur.close()
         conn.close()
 
-        return jsonify(data)
+        return jsonify({"success": True})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ====================================================
-# ADD PRODUCT
+# LOGIN API ✅
 # ====================================================
 
-@app.route('/api/products', methods=['POST'])
-def add_product():
+@app.route('/api/login', methods=['POST'])
+def login():
     d = request.json
+    email = d.get('email')
+    password = d.get('password')
 
     conn = get_db()
     cur = conn.cursor()
 
     if DB_TYPE == "postgres":
-        cur.execute("""
-        INSERT INTO products (name,category,price,image)
-        VALUES (%s,%s,%s,%s) RETURNING *
-        """, (d['name'], d['category'], d['price'], d['image']))
-        product = cur.fetchone()
+        cur.execute("SELECT * FROM users WHERE email=%s AND password=%s", (email, password))
+        user = cur.fetchone()
     else:
-        cur.execute("""
-        INSERT INTO products (name,category,price,image)
-        VALUES (?,?,?,?)
-        """, (d['name'], d['category'], d['price'], d['image']))
-        conn.commit()
-        cur.execute("SELECT * FROM products ORDER BY id DESC LIMIT 1")
-        product = dict(cur.fetchone())
+        cur.execute("SELECT * FROM users WHERE email=? AND password=?", (email, password))
+        row = cur.fetchone()
+        user = dict(row) if row else None
 
-    conn.commit()
     cur.close()
     conn.close()
 
-    return jsonify(product)
-
-# ====================================================
-# DELETE PRODUCT
-# ====================================================
-
-@app.route('/api/products/<int:id>', methods=['DELETE'])
-def delete_product(id):
-    conn = get_db()
-    cur = conn.cursor()
-
-    if DB_TYPE == "postgres":
-        cur.execute("DELETE FROM products WHERE id=%s", (id,))
+    if user:
+        return jsonify({"success": True, "name": user["name"], "email": user["email"]})
     else:
-        cur.execute("DELETE FROM products WHERE id=?", (id,))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return jsonify({"deleted": id})
+        return jsonify({"error": "Invalid credentials"}), 401
 
 # ====================================================
 # FRONTEND
