@@ -1,44 +1,38 @@
-from flask import Flask, request, jsonify, send_from_directory, session
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
-app = Flask(__name__, static_folder='../frontend', static_url_path='')
-app.secret_key = "gnr-secret"
-CORS(app, supports_credentials=True)
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+app = Flask(__name__, static_folder='frontend', static_url_path='')
+app.secret_key = 'gnr-secret'
+CORS(app)
 
 # ====================================================
-# OWNER AUTH
+# DATABASE SETUP
 # ====================================================
 
-OWNER_EMAIL = "owner@gnrfootwear.com"
-OWNER_PASSWORD = "gnr@owner2026"
+if os.environ.get("DATABASE_URL"):
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
 
-def is_owner():
-    return session.get('owner', False)
+    DATABASE_URL = os.environ.get("DATABASE_URL")
 
-@app.route('/api/owner/login', methods=['POST'])
-def owner_login():
-    d = request.json
-    if d['email'] == OWNER_EMAIL and d['password'] == OWNER_PASSWORD:
-        session['owner'] = True
-        return jsonify({"success": True})
-    return jsonify({"error": "Only owner allowed"}), 401
+    def get_db():
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-@app.route('/api/owner/logout', methods=['POST'])
-def owner_logout():
-    session.clear()
-    return jsonify({"success": True})
+    DB_TYPE = "postgres"
+else:
+    import sqlite3
 
-@app.route('/api/owner/check')
-def owner_check():
-    return jsonify({"logged_in": is_owner()})
+    DB_PATH = os.path.join(os.path.dirname(__file__), 'gnr.db')
+
+    def get_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    DB_TYPE = "sqlite"
+
+print("🔥 USING DB:", DB_TYPE)
 
 # ====================================================
 # INIT DATABASE
@@ -48,34 +42,47 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS products (
-        id SERIAL PRIMARY KEY,
-        name TEXT,
-        category TEXT,
-        price FLOAT,
-        original_price FLOAT,
-        discount INT,
-        image TEXT,
-        description TEXT,
-        extra TEXT,
-        sizes TEXT,
-        is_new INT,
-        in_stock INT,
-        stock_qty TEXT DEFAULT '{}'
-    )
-    """)
+    # PRODUCTS TABLE
+    if DB_TYPE == "postgres":
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            category TEXT,
+            price FLOAT,
+            image TEXT
+        )
+        """)
+    else:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            category TEXT,
+            price REAL,
+            image TEXT
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS stock_log (
-        id SERIAL PRIMARY KEY,
-        product_name TEXT,
-        action TEXT,
-        sizes_info TEXT,
-        note TEXT,
-        logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+    # USERS TABLE ✅ NEW
+    if DB_TYPE == "postgres":
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            email TEXT UNIQUE,
+            password TEXT
+        )
+        """)
+    else:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT UNIQUE,
+            password TEXT
+        )
+        """)
 
     conn.commit()
     cur.close()
@@ -84,161 +91,121 @@ def init_db():
 init_db()
 
 # ====================================================
-# PRODUCTS (PUBLIC GET)
+# PRODUCTS API
 # ====================================================
 
-@app.route('/api/products', methods=['GET'])
+@app.route('/api/products')
 def get_products():
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute("SELECT * FROM products ORDER BY id DESC")
-    data = cur.fetchall()
+
+    if DB_TYPE == "postgres":
+        data = cur.fetchall()
+    else:
+        data = [dict(row) for row in cur.fetchall()]
+
     cur.close()
     conn.close()
+
     return jsonify(data)
 
 # ====================================================
-# PRODUCTS (OWNER ONLY)
+# REGISTER API ✅
 # ====================================================
 
-@app.route('/api/products', methods=['POST'])
-def add_product():
-    if not is_owner():
-        return jsonify({"error": "Unauthorized"}), 403
+@app.route('/api/register', methods=['POST'])
+def register():
+    try:
+        d = request.json
+        name = d.get('name')
+        email = d.get('email')
+        password = d.get('password')
 
-    d = request.json
-    conn = get_db()
-    cur = conn.cursor()
+        conn = get_db()
+        cur = conn.cursor()
 
-    cur.execute("""
-    INSERT INTO products
-    (name,category,price,original_price,discount,image,description,extra,sizes,is_new,in_stock)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    RETURNING *
-    """, (
-        d['name'], d['category'], d['price'], d['original_price'],
-        d['discount'], d['image'], d['description'], d['extra'],
-        d['sizes'], int(d['is_new']), int(d['in_stock'])
-    ))
+        if DB_TYPE == "postgres":
+            cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+        else:
+            cur.execute("SELECT * FROM users WHERE email=?", (email,))
 
-    new = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-    return jsonify(new)
+        if cur.fetchone():
+            return jsonify({"error": "User already exists"}), 400
 
-@app.route('/api/products/<int:id>', methods=['PUT'])
-def update_product(id):
-    if not is_owner():
-        return jsonify({"error": "Unauthorized"}), 403
+        if DB_TYPE == "postgres":
+            cur.execute(
+                "INSERT INTO users (name,email,password) VALUES (%s,%s,%s)",
+                (name, email, password)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO users (name,email,password) VALUES (?,?,?)",
+                (name, email, password)
+            )
 
-    d = request.json
-    conn = get_db()
-    cur = conn.cursor()
+        conn.commit()
+        cur.close()
+        conn.close()
 
-    cur.execute("""
-    UPDATE products SET
-    name=%s,category=%s,price=%s,original_price=%s,discount=%s,
-    image=%s,description=%s,extra=%s,sizes=%s,is_new=%s,in_stock=%s
-    WHERE id=%s RETURNING *
-    """, (
-        d['name'], d['category'], d['price'], d['original_price'],
-        d['discount'], d['image'], d['description'], d['extra'],
-        d['sizes'], int(d['is_new']), int(d['in_stock']), id
-    ))
+        return jsonify({"success": True})
 
-    updated = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-    return jsonify(updated)
-
-@app.route('/api/products/<int:id>', methods=['DELETE'])
-def delete_product(id):
-    if not is_owner():
-        return jsonify({"error": "Unauthorized"}), 403
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM products WHERE id=%s", (id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ====================================================
-# STOCK (OWNER ONLY)
+# LOGIN API ✅
 # ====================================================
 
-@app.route('/api/products/<int:id>/stock', methods=['POST'])
-def update_stock(id):
-    if not is_owner():
-        return jsonify({"error": "Unauthorized"}), 403
-
+@app.route('/api/login', methods=['POST'])
+def login():
     d = request.json
-    stock_qty = str(d['stock_qty'])
+    email = d.get('email')
+    password = d.get('password')
 
     conn = get_db()
     cur = conn.cursor()
 
-    total = sum(d['stock_qty'].values())
+    if DB_TYPE == "postgres":
+        cur.execute("SELECT * FROM users WHERE email=%s AND password=%s", (email, password))
+        user = cur.fetchone()
+    else:
+        cur.execute("SELECT * FROM users WHERE email=? AND password=?", (email, password))
+        row = cur.fetchone()
+        user = dict(row) if row else None
 
-    cur.execute("""
-    UPDATE products
-    SET stock_qty=%s, in_stock=%s
-    WHERE id=%s RETURNING *
-    """, (stock_qty, 1 if total > 0 else 0, id))
-
-    product = cur.fetchone()
-
-    cur.execute("""
-    INSERT INTO stock_log (product_name,action,sizes_info,note)
-    VALUES (%s,%s,%s,%s)
-    """, (
-        product['name'],
-        d.get('action', 'Stock Updated'),
-        str(d['stock_qty']),
-        d.get('note', '')
-    ))
-
-    conn.commit()
     cur.close()
     conn.close()
-    return jsonify(product)
 
-@app.route('/api/stock-log')
-def stock_log():
-    if not is_owner():
-        return jsonify({"error": "Unauthorized"}), 403
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM stock_log ORDER BY id DESC LIMIT 50")
-    logs = cur.fetchall()
-    cur.close()
-    conn.close()
-    return jsonify(logs)
+    if user:
+        return jsonify({"success": True, "name": user["name"], "email": user["email"]})
+    else:
+        return jsonify({"error": "Invalid credentials"}), 401
 
 # ====================================================
 # FRONTEND
 # ====================================================
 
+
 @app.route('/')
 def home():
-    return send_from_directory('../frontend', 'index.html')
-
-@app.route('/owner')
-def owner():
-    return send_from_directory('../frontend', 'owner.html')
+    return send_from_directory('frontend', 'index.html')
 
 @app.route('/<path:path>')
 def serve(path):
+    if path.startswith('api'):
+        return jsonify({"error": "Not found"}), 404
     return send_from_directory('../frontend', path)
 
+@app.route('/owner')
+def owner():
+    return send_from_directory('frontend', 'owner.html')
+
 # ====================================================
-# RUN
+# MAIN
 # ====================================================
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
